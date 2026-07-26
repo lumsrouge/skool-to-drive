@@ -345,7 +345,7 @@ def cmd_render(args):
             entry.update(status="done", extracted_at=now_iso(), error=None,
                          stats={k: stats[k] for k in
                                 ("module_images", "resources", "posts", "attachments",
-                                 "comments", "reused_posts")})
+                                 "comments", "reused_posts", "post_videos")})
             ok += 1
         except Exception as e:  # one bad lesson must not abort a 107-lesson run
             entry.update(status="error", error=f"{type(e).__name__}: {e}")

@@ -99,15 +99,21 @@ MD_MENTION = re.compile(r"\[@([^\]]+)\]\(obj://user/[^)]+\)")
 MD_ESC = re.compile(r"\\([\\`*_{}\[\]()#+.!-])")
 
 
+LIST_TOK = re.compile(r"\[(?:ol(?::\d+)?|ul|li)\]")
+
+
 def plain_visible(content):
     """A post/comment `content` string as the reader should finally see it:
     markdown link syntax reduced to its label, mentions to @Name, backslash
-    escapes removed. Mirrors render_content() so a comparison tests delivery,
-    not formatting."""
+    escapes removed, and Skool's bracket list tokens dropped (they become real
+    <ul>/<ol> markup, so they must not be expected in the visible text).
+    Mirrors render_rich_content() so a comparison tests delivery, not
+    formatting."""
     if not content:
         return ""
     s = MD_MENTION.sub(lambda m: "@" + m.group(1), content)
     s = MD_LINK.sub(lambda m: m.group(1), s)
+    s = LIST_TOK.sub(" ", s)
     return MD_ESC.sub(r"\1", s)
 
 
@@ -151,8 +157,9 @@ def main():
 
     missing_text, missing_video, missing_img, missing_file = [], [], [], []
     missing_post, missing_comment, missing_res = [], [], []
+    missing_postvid, remote_imgs, leftover_markup = [], [], []
     tot_runs = tot_imgs = tot_vid = 0
-    tot_posts = tot_comments = tot_res = tot_attach = 0
+    tot_posts = tot_comments = tot_res = tot_attach = tot_postvid = 0
 
     for md, l in man["lessons"].items():
         folder = man["folder_map"][md]
@@ -161,7 +168,8 @@ def main():
             missing_file.append(folder)
             continue
         raw_html = ss.long_path(page).read_text(encoding="utf-8")
-        rendered = squash(visible_text(raw_html))
+        rendered_vis = visible_text(raw_html)
+        rendered = squash(rendered_vis)
 
         pp = json.loads(ss.long_path(pages / f"{md}.json").read_text(encoding="utf-8"))
         meta = (ss.find_module_node(pp.get("course"), md) or {}).get("metadata", {})
@@ -186,12 +194,47 @@ def main():
         has_video = bool((meta.get("videoLink") or "").strip() or (meta.get("videoId") or "").strip())
         if has_video:
             tot_vid += 1
-            if 'class="thumb-link"' not in raw_html:
+            # A poster that 403s legitimately degrades to a link-only card, so
+            # accept either a thumbnail or a watch link -- but not silence.
+            shown = ('class="thumb-link"' in raw_html
+                     or re.search(r">(Watch on Skool|Open on \w+|Open link)<", raw_html))
+            if not shown:
                 missing_video.append((l["set"], l["title"]))
+
+        # --- no raw Skool markup may survive into the visible text. Skool
+        #     encodes lists as [ol:N]/[ul]/[li] with no closing tags; if the
+        #     renderer doesn't understand a token it shows up verbatim to the
+        #     reader rather than failing loudly.
+        for tok in re.findall(r"\[(?:ol(?::\d+)?|ul|li)\]", rendered_vis):
+            leftover_markup.append((l["title"], tok))
+
+        # --- no page may depend on a remote image: this is an OFFLINE archive
+        for src in re.findall(r'<img[^>]+src="(https?://[^"]+)"', raw_html):
+            remote_imgs.append((l["title"], src[:60]))
 
         # --- pinned post bodies, and the comments hanging off them
         posts = ss.find_pinned_posts(pp)
         stub_owned = set(re.findall(r'also pinned under another lesson', raw_html))
+
+        # --- a post carrying its own video must show it (module video is NOT a
+        #     substitute -- they are distinct content)
+        post_vid_urls = []
+        for post in posts:
+            raw = (post.get("metadata") or {}).get("videoLinksData")
+            if not raw:
+                continue
+            try:
+                arr = json.loads(raw) if isinstance(raw, str) else raw
+            except (ValueError, TypeError):
+                arr = None
+            for v in arr or []:  # empty list is normal and means "no video"
+                if v.get("url"):
+                    post_vid_urls.append(v["url"])
+        unesc = H.unescape(raw_html)
+        for u in post_vid_urls:
+            tot_postvid += 1
+            if u not in unesc and not stub_owned:
+                missing_postvid.append((l["set"], l["title"], u[:60]))
         for post in posts:
             pm = post.get("metadata") or {}
             pid = post.get("id")
@@ -263,7 +306,10 @@ def main():
     print(f"pinned post bodies   : {tot_posts}   missing: {len(missing_post)}")
     print(f"comments             : {tot_comments}   missing: {len(missing_comment)}")
     print(f"resources            : {tot_res}   missing: {len(missing_res)}")
+    print(f"post-owned videos    : {tot_postvid}   missing: {len(missing_postvid)}")
     print(f"post attachments     : {tot_attach}")
+    print(f"remote image refs    : {len(remote_imgs)}   (must be 0 for a true offline archive)")
+    print(f"raw Skool markup left: {len(leftover_markup)}   (must be 0 — e.g. literal [li] on the page)")
     print(f"broken local assets  : {len(missing_file)}")
     for s, t, x in missing_text[:10]:
         print(f"   TEXT  {s} / {t}: {x!r}")
@@ -277,10 +323,17 @@ def main():
         print(f"   CMT   {t}: {x!r}")
     for t, why, x in missing_res[:10]:
         print(f"   RES   {t}: {why}: {x!r}")
+    for s, t, x in missing_postvid[:10]:
+        print(f"   PVID  {s} / {t}: {x!r}")
+    for t, x in leftover_markup[:10]:
+        print(f"   MARKUP {t}: {x!r}")
+    for t, x in remote_imgs[:10]:
+        print(f"   REMOTE {t}: {x!r}")
     for f in missing_file[:10]:
         print(f"   FILE  {f}")
     bad = (missing_text or missing_img or missing_video or missing_file
-           or missing_post or missing_comment or missing_res)
+           or missing_post or missing_comment or missing_res
+           or missing_postvid or remote_imgs or leftover_markup)
     print("\nRESULT:", "FAIL" if bad else "PASS — no content loss detected")
     return 1 if bad else 0
 

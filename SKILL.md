@@ -106,6 +106,31 @@ were caught by the user opening a page, not by any check:
   `video-thumbnail.jpg`; the video itself is still never downloaded, and the
   watch link points at the live (paid-gated) lesson URL.
 
+Three more of the same family, found 2026-07-26 by auditing surfaces the first
+checker never touched:
+
+- **A post's own video is NOT an alternative to the module's video.** A pinned
+  post can carry `metadata.videoLinksData`; the code used it only as a *fallback*
+  when the module had none, so 7 real post videos across 3 lessons vanished.
+  `render_post_block()` now takes an optional `video=`. Note `videoLinksData` is
+  often the string `"[]"` — truthy but empty — so test the *parsed* list.
+- **Skool encodes lists in post/comment text with bracket tokens and no closing
+  tags**: a line beginning `[ol:N]` or `[ul]`, items delimited by `[li]`, ending
+  at end-of-line. `render_content()` passed them through, so readers saw literal
+  `[ol:1][li]First, head over to…` — in **14 of 31 posts and 30 comments**. Use
+  `render_rich_content()` (block-level) for post bodies and comment bodies; the
+  comment bubble is a `<div class="c-body">`, not a `<p>`, so a list isn't nested
+  inside a paragraph.
+- **A missing thumbnail used to swallow the whole video.** `video_html()` bailed
+  out when `thumb_primary` was empty, dropping the link too. It now degrades to a
+  text link. Relatedly, when every poster candidate fails to download (one Loom
+  poster now 403s), `localize_video_thumb()` clears the poster rather than
+  keeping a remote URL that would render a broken image.
+
+**Posters are saved locally for every provider** so the archive is genuinely
+offline — verified 0 remote image references across 107 lessons. For Loom, swap
+the oEmbed `.gif` for `.jpg`: same frame, **~64 KB vs ~1.0 MB**.
+
 **Always run `verify_extraction.py <course folder>` after a bulk run.** It walks
 the cached *source* JSON and asserts every text run, image and video actually
 reached the HTML — the only check that can catch this bug class. When comparing

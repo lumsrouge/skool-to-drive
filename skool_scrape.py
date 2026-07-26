@@ -203,9 +203,29 @@ def resolve_attachments(attachment_ids, attachments_info):
     return out
 
 
+def thumb_candidates(url):
+    """Download candidates for a poster URL, best (smallest) first.
+
+    Loom's oEmbed hands back an ANIMATED GIF preview (~1.0-1.4 MB). Swapping the
+    extension to .jpg returns the same frame as a ~64 KB still -- 16x smaller,
+    verified live 2026-07-26 -- which matters because every Loom-backed lesson
+    saves one locally. Falls back to the original if the .jpg isn't there."""
+    if not url:
+        return []
+    if url.lower().endswith(".gif") and "cdn.loom.com" in url:
+        return [re.sub(r"\.gif$", ".jpg", url, flags=re.I), url]
+    return [url]
+
+
 def resolve_video_from_data(video_links_data_raw):
     """Post-level `videoLinksData` is a JSON-string list already carrying
-    url/thumbnail/title/len_ms -- no API call needed."""
+    url/thumbnail/title/len_ms -- no API call needed.
+
+    Note the list can legitimately be EMPTY (`"[]"`), which is still truthy as a
+    string -- test the parsed list, not the raw field, or you will count posts
+    that have no video (5 such posts in the reference classroom). Verified on
+    real data that the list never holds more than one entry, so taking [0] is
+    complete rather than lossy."""
     if not video_links_data_raw:
         return None
     data = json.loads(video_links_data_raw) if isinstance(video_links_data_raw, str) else video_links_data_raw
@@ -220,6 +240,7 @@ def resolve_video_from_data(video_links_data_raw):
         "watch_url": v.get("url"),
         "thumb_primary": v.get("thumbnail"),
         "thumb_fallback": v.get("thumbnail"),
+        "thumb_download_urls": thumb_candidates(v.get("thumbnail")),
         "title": v.get("title"),
         "note": f"{mins}:{secs:02d}" if len_ms else None,
     }
@@ -266,19 +287,33 @@ def resolve_skool_video(page_props, meta, lesson_url):
     }
 
 
-def localize_video_thumb(video, lesson_dir):
+def localize_video_thumb(video, lesson_dir, basename="video-thumbnail"):
     """Save the poster frame next to the HTML so the page renders offline and
     doesn't depend on a remote URL staying alive. Falls back through the
-    candidate URLs so a Mux hiccup degrades to the assets.skool.com PNG rather
-    than losing the video card entirely."""
+    candidate URLs so a Mux hiccup (or a Loom poster that has started 403'ing)
+    degrades to the next candidate, and finally to the remote URL, rather than
+    losing the video card.
+
+    `basename` keeps posters distinct within one lesson folder: a lesson has one
+    module video plus potentially one per pinned post, and they would otherwise
+    overwrite each other."""
     if not video:
         return video
-    for url in video.get("thumb_download_urls") or []:
-        fname = download_public_image(url, lesson_dir, "video-thumbnail")
+    candidates = video.get("thumb_download_urls") or []
+    for url in candidates:
+        fname = download_public_image(url, lesson_dir, basename)
         if fname:
             video["thumb_primary"] = f"./{fname}"
             video["thumb_fallback"] = None
             return video
+    if candidates:
+        # Every candidate failed (a real case: one Loom poster now 403s). Keeping
+        # the remote URL would render a broken-image icon AND leave the archive
+        # dependent on a dead third-party link. Drop the poster instead so
+        # video_html() degrades to a clean text link -- the video is still
+        # reachable, just without a thumbnail.
+        video["thumb_primary"] = None
+        video["thumb_fallback"] = None
     return video
 
 
@@ -295,6 +330,9 @@ def resolve_video(link):
             "watch_url": link,
             "thumb_primary": f"https://i.ytimg.com/vi/{vid}/maxresdefault.jpg",
             "thumb_fallback": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
+            # maxres doesn't exist for every upload; hqdefault always does.
+            "thumb_download_urls": [f"https://i.ytimg.com/vi/{vid}/maxresdefault.jpg",
+                                    f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"],
             "title": None,
             "note": None,
         }
@@ -310,6 +348,7 @@ def resolve_video(link):
                 "watch_url": link,
                 "thumb_primary": d.get("thumbnail_url"),
                 "thumb_fallback": d.get("thumbnail_url"),
+                "thumb_download_urls": thumb_candidates(d.get("thumbnail_url")),
                 "title": d.get("title"),
                 "note": f"{mins}:{secs:02d}",
             }
@@ -339,6 +378,56 @@ def render_content(text):
         return f'<a href="{html.escape(m.group(1))}">{html.escape(m.group(1))}</a>'
     text = BARE_URL_RE.sub(linkify_bare, text)
     return text.replace("\n", "<br>")
+
+
+LIST_OPEN_RE = re.compile(r"^\[(?:(ol)(?::(\d+))?|(ul))\]")
+
+
+def render_rich_content(text):
+    """Block-level renderer for post/comment `content` strings.
+
+    Skool encodes lists inline with bracket tokens and NO closing tags: a line
+    that BEGINS with `[ol:N]` or `[ul]` carries the whole list, `[li]` delimits
+    the items, and the list ends at end-of-line (verified 2026-07-26 across
+    every post and comment in the reference course -- the marker never appears
+    mid-line). render_content() alone left these as literal text, so readers saw
+    "[ol:1][li]First, head over to Zapmail[li]Purchase your mailboxes" printed
+    verbatim on the page -- affecting 14 of 31 posts and 30 comments.
+
+    Blank lines separate paragraphs; everything else goes through
+    render_content() for mentions/links/escapes exactly as before."""
+    if not text:
+        return ""
+    out, para = [], []
+
+    def flush():
+        if para:
+            out.append(f'<p>{"<br>".join(para)}</p>')
+            para.clear()
+
+    for raw_line in text.split("\n"):
+        m = LIST_OPEN_RE.match(raw_line)
+        if not m:
+            line = render_content(raw_line)
+            if line.strip():
+                para.append(line)
+            else:
+                flush()
+            continue
+        flush()
+        ordered = bool(m.group(1))
+        items = [i for i in raw_line[m.end():].split("[li]") if i.strip()]
+        lis = "".join(f"<li>{render_content(i)}</li>" for i in items)
+        if not lis:
+            continue
+        if ordered:
+            start = m.group(2)
+            attr = f' start="{int(start)}"' if start and start.isdigit() and int(start) != 1 else ""
+            out.append(f"<ol{attr}>{lis}</ol>")
+        else:
+            out.append(f"<ul>{lis}</ul>")
+    flush()
+    return "\n".join(out)
 
 
 IMG_EXT_BY_CONTENT_TYPE = {
@@ -543,7 +632,9 @@ def render_comments_html(comments):
     for c in comments:
         indent = 44 * c["depth"]
         date = c["created_at"][:10]
-        body = render_content(c["content"])
+        # Block-level: a comment can contain a Skool bracket list, which must not
+        # end up nested inside a <p>.
+        body = render_rich_content(c["content"])
         gif_note = '<span class="gif-note">[GIF reaction — not copied, per policy]</span>' if c["has_gif"] else ""
         if not body and gif_note:
             body = gif_note
@@ -555,7 +646,7 @@ def render_comments_html(comments):
             f'<div class="c-avatar" style="background:{avatar_color(c["author"])}">{html.escape(initials(c["author"]))}</div>'
             f'<div class="c-main"><div class="c-bubble">'
             f'<p class="c-meta"><strong>{html.escape(c["author"])}</strong> &nbsp;·&nbsp; {date}</p>'
-            f'<p class="c-body">{body}</p></div>'
+            f'<div class="c-body">{body}</div></div>'
             f'<div class="c-actions">{actions}</div></div></div>'
         )
     return "".join(rows)
@@ -690,6 +781,12 @@ h1.p-title{font-size:23px;font-weight:700;color:#fff;margin:0 0 14px}
 .c-meta{margin:0;font-size:13px;color:var(--muted)}
 .c-meta strong{color:#fff;font-weight:700}
 .c-body{margin:4px 0 0;font-size:15px;color:var(--text);line-height:1.5}
+.c-body p{margin:0 0 6px}
+.c-body p:last-child{margin-bottom:0}
+.c-body ul,.c-body ol{margin:6px 0;padding-left:20px}
+.c-body li{margin:2px 0}
+.c-body a,.c-body a:visited{color:var(--accent);text-decoration:none}
+.c-body a:hover{text-decoration:underline}
 .c-actions{margin:4px 0 0 4px;font-size:13px;color:var(--muted)}
 .gif-note{color:#8a8a8a;font-style:italic;font-size:13px}
 hr{border:none;border-top:1px solid var(--border);margin:32px 0 14px}
@@ -697,26 +794,36 @@ hr{border:none;border-top:1px solid var(--border);margin:32px 0 14px}
 
 
 def video_html(video):
-    if not video or not video.get("thumb_primary"):
+    """Returns (thumbnail_html, caption_html).
+
+    A missing thumbnail must NOT swallow the video. This used to bail out
+    whenever `thumb_primary` was empty, which meant a video whose poster was
+    unavailable -- an "other"-provider link, a failed Loom oEmbed lookup, or a
+    Loom thumbnail that has since 403'd (one real case in Maker School) --
+    rendered as absolutely nothing, link included. Same silent-drop family as
+    the unhandled node types: degrade to a link, never to silence."""
+    if not video or not video.get("watch_url"):
         return "", ""
     link_label = {"youtube": "Open on YouTube", "loom": "Open on Loom",
                   "skool": "Watch on Skool"}.get(video["kind"], "Open link")
+    extra = " — \"" + video["title"] + "\"" if video.get("title") else ""
+    if video.get("note"):
+        extra += f", {video['note']}"
+    caption = (f'<p class="meta"><a href="{html.escape(video["watch_url"])}" '
+               f'style="color:var(--accent)">{link_label}</a>{extra}</p>')
+    if not video.get("thumb_primary"):
+        return "", caption
     onerror = (f"onerror=\"this.onerror=null;this.src='{video['thumb_fallback']}'\""
                if video.get("thumb_fallback") and video["thumb_fallback"] != video["thumb_primary"] else "")
     thumb = (f'<a class="thumb-link" href="{html.escape(video["watch_url"])}" target="_blank">'
              f'<img src="{html.escape(video["thumb_primary"])}" {onerror} alt="Video thumbnail">'
              f'<div class="play"></div></a>')
-    caption_bits = [f'<a href="{html.escape(video["watch_url"])}" style="color:var(--accent)">{link_label}</a>']
-    extra = " — \"" + video["title"] + "\"" if video.get("title") else ""
-    if video.get("note"):
-        extra += f", {video['note']}"
-    caption = f'<p class="meta">{caption_bits[0]}{extra}</p>'
     return thumb, caption
 
 
 def render_post_block(post_title, author_name, date_sub, body_html, attachment_files,
                        upvotes, comment_count, comment_rows, comments_html_str, gap_note,
-                       label="Pinned discussion post"):
+                       label="Pinned discussion post", video=None):
     """Renders one pinned community post as its own self-contained card, with its
     OWN comments nested directly inside it -- these are two distinct pieces of
     content from the module's own lesson body (verified live 2026-07-11: a
@@ -724,7 +831,14 @@ def render_post_block(post_title, author_name, date_sub, body_html, attachment_f
     shorter discussion post pinned underneath it), not alternatives. A lesson
     can have more than one pinned post; each must stay self-contained (own
     comments/attachments) rather than pooling everything under one heading,
-    or a multi-post lesson turns into an unreadable mess."""
+    or a multi-post lesson turns into an unreadable mess.
+
+    `video` is the post's OWN video (`metadata.videoLinksData`), which is
+    likewise distinct from the module's video rather than an alternative to it.
+    Treating them as alternatives -- using a post video only as a fallback when
+    the module had none -- silently dropped 7 real post videos across 3 lessons
+    (found 2026-07-26), the same mistake this docstring already warned about for
+    post bodies. Defaults to None so the single-lesson path is unchanged."""
     attach_block = ""
     if attachment_files:
         image_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
@@ -756,6 +870,7 @@ def render_post_block(post_title, author_name, date_sub, body_html, attachment_f
   </details>
 """
     title_html = f'<h2 class="p-title" style="font-size:19px">{html.escape(post_title)}</h2>' if post_title else ""
+    post_thumb, post_caption = video_html(video)
     return f"""
 <p class="pinned-label">{html.escape(label)}</p>
 <div class="card">
@@ -772,6 +887,9 @@ def render_post_block(post_title, author_name, date_sub, body_html, attachment_f
   <div class="p-body">
     {body_html}
   </div>
+
+  {post_thumb}
+  {post_caption}
 
   {attach_block}
 
@@ -1131,10 +1249,17 @@ def extract_lesson(session, group, course, md, out_root, build_id=None,
         # Skool-hosted video (no videoLink, just a videoId) -- the common case:
         # 91 of 107 lessons in the reference classroom.
         video = resolve_skool_video(page_props, meta, lesson_url)
+    # If the module itself has no video, promote the first post video into the
+    # lesson's top slot (long-standing behaviour). Remember WHICH post that was,
+    # so its card doesn't then render the same video a second time. Every other
+    # post still renders its own video inside its own card -- module video and
+    # post video are distinct content, not alternatives.
+    promoted_post_id = None
     if not video:
         for p in posts:
             video = resolve_video_from_data(p.get("metadata", {}).get("videoLinksData"))
             if video:
+                promoted_post_id = p.get("id")
                 break
     video = localize_video_thumb(video, lesson_dir)
 
@@ -1149,7 +1274,7 @@ def extract_lesson(session, group, course, md, out_root, build_id=None,
     # Each pinned post is rendered as its own self-contained card with its own
     # comments/attachments nested directly inside it -- never pooled together,
     # so a lesson with several posts doesn't turn into one flat wall of comments.
-    total_attachments, total_comments, reused_posts = 0, 0, 0
+    total_attachments, total_comments, reused_posts, total_post_videos = 0, 0, 0, 0
     post_html_parts = []
     multi = len(posts) > 1
     for idx, post in enumerate(posts, start=1):
@@ -1201,7 +1326,17 @@ def extract_lesson(session, group, course, md, out_root, build_id=None,
             comments_html_str = render_comments_html(merged)
             total_comments += len(merged)
 
-        post_body_html = "\n    ".join(f"<p>{p}</p>" for p in render_content(pm.get("content", "")).split("<br><br>"))
+        # The post's own video, rendered inside its own card (unless it was
+        # already promoted to the lesson's top slot above).
+        post_video = None
+        if post_id != promoted_post_id:
+            post_video = resolve_video_from_data(pm.get("videoLinksData"))
+            if post_video:
+                post_video = localize_video_thumb(
+                    post_video, lesson_dir, basename=f"post-{idx}-video-thumbnail")
+                total_post_videos += 1
+
+        post_body_html = render_rich_content(pm.get("content", ""))
         post_html_parts.append(render_post_block(
             post_title=pm.get("title") or "",
             author_name=author,
@@ -1214,6 +1349,7 @@ def extract_lesson(session, group, course, md, out_root, build_id=None,
             comments_html_str=comments_html_str,
             gap_note=gap_note,
             label=label,
+            video=post_video,
         ))
     post_html = "\n".join(post_html_parts)
 
@@ -1235,13 +1371,15 @@ def extract_lesson(session, group, course, md, out_root, build_id=None,
     if verbose:
         print(f"Wrote {out_path}")
         print(f"Module images: {module_image_count} | Resources: {len(resources)} | "
-              f"Posts: {len(posts)} | Post attachments: {total_attachments} | Comments: {total_comments}")
+              f"Posts: {len(posts)} | Post attachments: {total_attachments} | "
+              f"Post videos: {total_post_videos} | Comments: {total_comments}")
 
     return {
         "md": md, "title": title, "folder": lesson_dir_name, "path": str(out_path),
         "module_images": module_image_count, "resources": len(resources),
         "posts": len(posts), "attachments": total_attachments,
         "comments": total_comments, "reused_posts": reused_posts,
+        "post_videos": total_post_videos,
         "build_id": build_id,
     }
 
