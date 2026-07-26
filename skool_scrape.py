@@ -246,6 +246,52 @@ def resolve_video_from_data(video_links_data_raw):
     }
 
 
+def resolve_post_hosted_video(session, build_id, group, post):
+    """A pinned post's SKOOL-HOSTED video.
+
+    Posts have two separate video fields, exactly mirroring the module-level
+    split that already caught us once:
+      - `metadata.videoLinksData` -> EXTERNAL video (Loom/YouTube), self-contained
+      - `metadata.videoIds`       -> SKOOL-HOSTED video, id only
+    Reading only `videoLinksData` dropped 5 Skool-hosted post videos on one real
+    lesson (found 2026-07-26 when the user noticed missing videos on Day 8).
+
+    The playback data is NOT in the lesson's `_next/data` -- only the bare id is.
+    It lives on the POST's own page under `pageProps.postTree.videos[]`, keyed by
+    that id, reachable at `/_next/data/<buildId>/<group>/<post.name>.json`. That
+    is `www.skool.com`, NOT the WAF-gated `api2`, so this needs no browser step.
+    Unlike module videos there is no `thumbnailUrl`, so the poster comes from Mux
+    (`image.mux.com/<playbackId>/thumbnail.jpg?token=<thumbnailToken>`)."""
+    pm = post.get("metadata") or {}
+    ids = [v.strip() for v in (pm.get("videoIds") or "").split(",") if v.strip()]
+    slug = post.get("name")
+    if not ids or not slug:
+        return None
+    url = f"https://www.skool.com/_next/data/{build_id}/{group}/{slug}.json"
+    try:
+        r = http_get(url, session=session, headers={"x-nextjs-data": "1"})
+        if r.status_code != 200:
+            return None
+        videos = ((r.json().get("pageProps") or {}).get("postTree") or {}).get("videos") or []
+    except (requests.RequestException, ValueError):
+        return None
+    v = next((x for x in videos if x.get("id") == ids[0]), None)
+    if not v or not v.get("playbackId") or not v.get("thumbnailToken"):
+        return None
+    len_ms = v.get("duration") or 0
+    mins, secs = divmod(int(len_ms / 1000), 60)
+    thumb = f"https://image.mux.com/{v['playbackId']}/thumbnail.jpg?token={v['thumbnailToken']}"
+    return {
+        "kind": "skool",
+        "watch_url": f"https://www.skool.com/{group}/{slug}",
+        "thumb_primary": thumb,
+        "thumb_fallback": None,
+        "thumb_download_urls": [thumb],
+        "title": pm.get("title"),
+        "note": f"{mins}:{secs:02d}" if len_ms else None,
+    }
+
+
 def resolve_skool_video(page_props, meta, lesson_url):
     """Skool-HOSTED video (Mux-backed), which has no `videoLink` at all.
 
@@ -1330,7 +1376,10 @@ def extract_lesson(session, group, course, md, out_root, build_id=None,
         # already promoted to the lesson's top slot above).
         post_video = None
         if post_id != promoted_post_id:
-            post_video = resolve_video_from_data(pm.get("videoLinksData"))
+            # External video first, then the Skool-hosted one -- a post uses one
+            # or the other, and reading only the former lost 5 real videos.
+            post_video = (resolve_video_from_data(pm.get("videoLinksData"))
+                          or resolve_post_hosted_video(session, build_id, group, post))
             if post_video:
                 post_video = localize_video_thumb(
                     post_video, lesson_dir, basename=f"post-{idx}-video-thumbnail")

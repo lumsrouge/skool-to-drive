@@ -301,18 +301,34 @@ def cmd_render(args):
     if chunk is None:
         sys.exit(f"No chunk {args.chunk} in manifest (have 0..{len(man['chunks'])-1}).")
 
-    todo = [md for md in chunk["mds"]
+    mds = chunk["mds"]
+    if args.only:
+        # Match an md id outright, or a case-insensitive substring of the folder
+        # name / title -- so `--only "Day 8"` re-does one day without touching
+        # the rest of its chunk.
+        needles = [n.lower() for n in args.only]
+        mds = [md for md in mds
+               if any(n == md.lower()
+                      or n in man["folder_map"][md].lower()
+                      or n in man["lessons"][md]["title"].lower()
+                      for n in needles)]
+        if not mds:
+            sys.exit(f"--only {args.only} matched no lesson in chunk {args.chunk}.")
+        print(f"--only: {len(mds)} of {len(chunk['mds'])} lesson(s) in this chunk")
+
+    todo = [md for md in mds
             if args.force or man["lessons"][md]["status"] != "done"]
-    skipped = len(chunk["mds"]) - len(todo)
+    skipped = len(mds) - len(todo)
     if skipped:
         print(f"Skipping {skipped} already-extracted lesson(s) — re-run with --force to redo them.")
     if not todo:
         # Nothing left to do, so don't demand a browser payload for work that is
         # already finished -- that would make a plain re-run of a completed
         # chunk look like a failure.
-        chunk["status"] = "done"
-        save_manifest(out_root, man)
-        print(f"Chunk {args.chunk}: nothing to do — all {len(chunk['mds'])} lesson(s) already extracted.")
+        if not args.only:
+            chunk["status"] = "done"
+            save_manifest(out_root, man)
+        print(f"Chunk {args.chunk}: nothing to do — all {len(mds)} lesson(s) already extracted.")
         return
 
     browser_data = {}
@@ -335,7 +351,14 @@ def cmd_render(args):
         print(f"[{i}/{len(todo)}] {entry['title'][:60]}")
         try:
             cache = pages_dir / f"{md}.json"
-            pp = json.loads(ss.long_path(cache).read_text(encoding="utf-8")) if cache.exists() else None
+            if args.refresh or not cache.exists():
+                # Re-pull the lesson from Skool so a re-extract picks up edits and
+                # newly posted comments rather than replaying this morning's cache.
+                pp, build_id = ss.fetch_lesson_json_retrying(session, build_id, group, course, md)
+                ss.long_path(cache).write_text(json.dumps(pp, ensure_ascii=False), encoding="utf-8")
+                man["build_id"] = build_id
+            else:
+                pp = json.loads(ss.long_path(cache).read_text(encoding="utf-8"))
             nav = ss.build_nav((pp or {}).get("course"), md) if pp else None
             stats = ss.extract_lesson(
                 session, group, course, md, out_root, build_id=build_id,
@@ -411,6 +434,8 @@ def main():
     r.add_argument("--chunk", type=int, required=True)
     r.add_argument("--browser-data")
     r.add_argument("--force", action="store_true", help="Re-render lessons already marked done")
+    r.add_argument("--only", nargs="+", help="Limit to lessons matching these md ids / folder or title substrings (e.g. --only \"Day 8\")")
+    r.add_argument("--refresh", action="store_true", help="Re-fetch each lesson from Skool instead of using the cached page JSON")
     r.add_argument("--quiet", action="store_true")
     r.set_defaults(func=cmd_render)
 

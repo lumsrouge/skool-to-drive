@@ -218,23 +218,35 @@ def main():
 
         # --- a post carrying its own video must show it (module video is NOT a
         #     substitute -- they are distinct content)
-        post_vid_urls = []
+        post_vid_urls, post_hosted = [], 0
         for post in posts:
-            raw = (post.get("metadata") or {}).get("videoLinksData")
-            if not raw:
-                continue
-            try:
-                arr = json.loads(raw) if isinstance(raw, str) else raw
-            except (ValueError, TypeError):
-                arr = None
+            pmeta = post.get("metadata") or {}
+            raw = pmeta.get("videoLinksData")
+            arr = None
+            if raw:
+                try:
+                    arr = json.loads(raw) if isinstance(raw, str) else raw
+                except (ValueError, TypeError):
+                    arr = None
             for v in arr or []:  # empty list is normal and means "no video"
                 if v.get("url"):
                     post_vid_urls.append(v["url"])
+            # A post uses EITHER an external video (videoLinksData) or a
+            # Skool-hosted one (videoIds) -- count the hosted case too.
+            if not arr and (pmeta.get("videoIds") or "").strip():
+                post_hosted += 1
         unesc = H.unescape(raw_html)
         for u in post_vid_urls:
             tot_postvid += 1
             if u not in unesc and not stub_owned:
                 missing_postvid.append((l["set"], l["title"], u[:60]))
+        if post_hosted and not stub_owned:
+            tot_postvid += post_hosted
+            shown = len(re.findall(r'src="\./post-\d+-video-thumbnail', raw_html))
+            # posters for external post videos use the same naming, so subtract them
+            if shown - len(post_vid_urls) < post_hosted:
+                missing_postvid.append((l["set"], l["title"],
+                                        f"{post_hosted} Skool-hosted post video(s) not rendered"))
         for post in posts:
             pm = post.get("metadata") or {}
             pid = post.get("id")
